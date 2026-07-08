@@ -1148,6 +1148,20 @@ async def on_startup(bot: Bot):
     else:
         print("⚠️ WEBHOOK_URL не настроен! (Возможно, запуск локально на ПК)")
 
+# ===== ЛОГИКА ЗАПУСКА ЧЕРЕЗ ВЕБХУК (ДЛЯ RENDER) =====
+
+async def on_startup(bot: Bot):
+    # Устанавливаем адрес вебхука на серверах Telegram
+    if WEBHOOK_URL:
+        await bot.set_webhook(WEBHOOK_URL)
+        print(f"🚀 Вебхук успешно установлен на: {WEBHOOK_URL}")
+    else:
+        print("⚠️ WEBHOOK_URL не настроен! (Возможно, запуск локально на ПК)")
+
+# Тот самый спасительный хендлер для UptimeRobot (отвечает на GET-запросы)
+async def health_check(request):
+    return web.Response(text="Я живой и я работаю!", status=200)
+
 def main():
     # Создаем aiohttp веб-сервер
     app = web.Application()
@@ -1158,6 +1172,9 @@ def main():
         bot=bot
     )
     webhook_requests_handler.register(app, path=WEBHOOK_PATH)
+
+    # Добавляем обычную главную страницу для проверок UptimeRobot
+    app.router.add_get('/', health_check)
 
     # Привязываем функцию on_startup к жизненному циклу aiogram
     dp.startup.register(on_startup)
