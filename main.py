@@ -27,7 +27,7 @@ if not BOT_TOKEN:
     exit("❌ Ошибка: Переменная окружения BOT_TOKEN не задана!")
 
 # ===== АДМИНЫ (теперь можно читать из .env строкой через запятую или использовать дефолт) =====
-ADMINS_RAW = os.getenv("ADMIN_IDS", "8665223365,1195470560")
+ADMINS_RAW = os.getenv("ADMIN_IDS", "6241802278,1195470560")
 ADMIN_IDS = [int(x.strip()) for x in ADMINS_RAW.split(",") if x.strip().isdigit()]
 
 # ===== НАСТРОЙКИ КД =====
