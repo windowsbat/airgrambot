@@ -262,7 +262,7 @@ async def start_command(message: types.Message):
     total_users = await get_user_count()
     
     welcome_text = (
-        "🌟 <b>Добро пожаловать в AirgramBot! донат, юз в аир: @botair</b>\n"
+        "🌟 <b>Добро пожаловать в AirgramBot! донат юз в аир: @botair</b>\n"
         "───────────────────────────\n"
         "📱 Пожалуйста, отправьте нам свой юзернейм в мессенджере <b>Airgram</b>.\n"
         "🎁 После успешной проверки вы получите подарок!\n\n"
