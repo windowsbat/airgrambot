@@ -1,6 +1,7 @@
-﻿import asyncio
+import asyncio
 import logging
 import os
+import json  # добавлен для парсинга credentials
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, types, F
@@ -46,13 +47,37 @@ dp = Dispatcher(storage=storage)
 # ===== ХРАНИЛИЩЕ КД (ОСТАЕТСЯ В ОЗУ) =====
 user_cooldowns = {"application": {}, "support": {}}
 
-# ===== ИНИЦИАЛИЗАЦИЯ FIREBASE FIRESTORE =====
-# Переносим твои настройки в инициализацию клиента Firestore.
-# Используем анонимную/клиентскую аутентификацию или прямую инициализацию по Project ID.
-# Примечание: Для работы google-cloud-firestore без сервисного аккаунта на запись
-# убедись, что в Firestore Rules (настройки правил в консоли Firebase) разрешен доступ.
-# Правила для тестов (вкладка Rules в Firebase): match /{document=**} { allow read, write: if true; }
-db = firestore.Client(project="gfsdksfg")
+# ===== ИНИЦИАЛИЗАЦИЯ FIREBASE FIRESTORE С УЧЁТНЫМИ ДАННЫМИ =====
+FIREBASE_PROJECT = os.getenv("FIREBASE_PROJECT_ID", "gfsdksfg")  # ID вашего проекта
+
+def init_firestore():
+    """
+    Инициализация клиента Firestore.
+    Сначала пробует использовать переменную окружения FIREBASE_CREDENTIALS (JSON-строка),
+    затем стандартный механизм ADC (GOOGLE_APPLICATION_CREDENTIALS).
+    """
+    creds_json = os.getenv("FIREBASE_CREDENTIALS")
+    if creds_json:
+        try:
+            creds_info = json.loads(creds_json)
+            credentials = service_account.Credentials.from_service_account_info(creds_info)
+            project = creds_info.get("project_id", FIREBASE_PROJECT)
+            logging.info("✅ Firestore инициализирован через FIREBASE_CREDENTIALS")
+            return firestore.Client(project=project, credentials=credentials)
+        except Exception as e:
+            logging.error(f"❌ Ошибка загрузки FIREBASE_CREDENTIALS: {e}")
+
+    # Если не задана FIREBASE_CREDENTIALS, пробуем стандартный путь (ADC)
+    try:
+        # Если переменная GOOGLE_APPLICATION_CREDENTIALS указывает на файл, он будет найден автоматически
+        db = firestore.Client(project=FIREBASE_PROJECT)
+        logging.info("✅ Firestore инициализирован через ADC (GOOGLE_APPLICATION_CREDENTIALS)")
+        return db
+    except Exception as e:
+        logging.error(f"❌ Ошибка инициализации Firestore через ADC: {e}")
+        raise RuntimeError("Не удалось инициализировать Firestore. Убедитесь, что задана FIREBASE_CREDENTIALS или GOOGLE_APPLICATION_CREDENTIALS.")
+
+db = init_firestore()
 
 # Вспомогательная функция для генерации ID документов в строковом формате
 def s_id(user_id):
@@ -86,8 +111,8 @@ def format_cooldown_time(seconds: int) -> str:
 # ===== АСИНХРОННЫЕ ФУНКЦИИ БАЗЫ ДАННЫХ (FIREBASE) =====
 
 async def init_db():
-    # В Firestore таблицы (коллекции) создаются автоматически при добавлении первой записи.
-    # Но для счетчика статистики создадим дефолтное значение, если его нет.
+    # В Firestore коллекции создаются автоматически при добавлении первой записи.
+    # Для счетчика статистики создадим дефолтное значение, если его нет.
     stats_ref = db.collection("stats").document("accepted_count")
     if not stats_ref.get().exists:
         stats_ref.set({"value": 0})
@@ -144,13 +169,11 @@ async def get_user_applications(user_id):
     return [[d.to_dict().get("date"), d.to_dict().get("username"), d.to_dict().get("status")] for d in docs]
 
 async def update_application_status(user_id, status):
-    # Обновляем статус заявки
     docs = db.collection("applications").where("user_id", "==", int(user_id)).where("status", "==", "pending").stream()
     for d in docs:
         db.collection("applications").document(d.id).update({"status": status})
     
     if status == 'accepted':
-        # Инкрементируем счетчики
         db.collection("users").document(s_id(user_id)).update({"accepted_applications": firestore.Increment(1)})
         db.collection("stats").document("accepted_count").update({"value": firestore.Increment(1)})
 
@@ -216,8 +239,7 @@ async def get_user_stats(user_id):
     return None
 
 async def get_user_count():
-    # Метод получения размера коллекции
-    docs = db.collection("users").maps() # Быстрый подсчет элементов
+    # Быстрый подсчет количества документов в коллекции
     return len(db.collection("users").get())
 
 async def get_user_id_by_username(username):
