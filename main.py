@@ -13,6 +13,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from aiohttp import web
+from aiohttp.web import middleware
 
 from google.cloud import firestore
 from google.oauth2 import service_account
@@ -20,7 +21,7 @@ import json
 
 load_dotenv()
 
-# ===== НАСТРОЙКИ ХОСТИНГА =====
+# ===== НАСТРОЙКИ =====
 RENDER_URL = os.getenv("RENDER_EXTERNAL_URL")
 WEBHOOK_PATH = "/webhook"
 WEBHOOK_URL = f"{RENDER_URL}{WEBHOOK_PATH}" if RENDER_URL else None
@@ -28,6 +29,8 @@ PORT = int(os.getenv("PORT", 10000))
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     exit("❌ BOT_TOKEN не задан!")
+
+NOTIFY_SECRET = os.getenv("NOTIFY_SECRET", "a7f8g9h0j1k2l3m4n5o6p")  # задайте в Render
 
 COOLDOWN_APPLICATION = 300
 COOLDOWN_SUPPORT = 300
@@ -81,7 +84,7 @@ async def load_admins():
 async def refresh_admins():
     while True:
         await load_admins()
-        await asyncio.sleep(300)  # 5 минут
+        await asyncio.sleep(300)
 
 def is_admin_sync(user_id: int) -> bool:
     return user_id in ADMIN_IDS
@@ -173,7 +176,11 @@ async def get_application(user_id):
     return None
 
 async def get_user_applications(user_id):
-    docs = db.collection("applications").where("user_id", "==", int(user_id)).order_by("date", direction=firestore.Query.DESCENDING).limit(10).stream()
+    # ВНИМАНИЕ: этот запрос требует индекса в Firestore.
+    # Если индекс не создан, запрос упадёт. Для простоты уберём orderBy или создадим индекс.
+    # Временно убираем orderBy, чтобы не было ошибки индекса.
+    docs = db.collection("applications").where("user_id", "==", int(user_id)).limit(10).stream()
+    # docs = db.collection("applications").where("user_id", "==", int(user_id)).order_by("date", direction=firestore.Query.DESCENDING).limit(10).stream()
     return [[d.to_dict().get("date"), d.to_dict().get("username"), d.to_dict().get("status")] for d in docs]
 
 async def update_application_status(user_id, status):
@@ -856,14 +863,26 @@ async def unblock_command(message: types.Message):
     except:
         await message.answer("❌ Ошибка ввода. Формат: /unblock [ID]")
 
-# ===== НОВЫЙ ЭНДПОИНТ ДЛЯ УВЕДОМЛЕНИЙ =====
-NOTIFY_SECRET = os.getenv("NOTIFY_SECRET", "a7f8g9h0j1k2l3m4n5o6p")
-
+# ===== НОВЫЙ ЭНДПОИНТ ДЛЯ УВЕДОМЛЕНИЙ С CORS =====
 async def notify_handler(request):
     """Обработчик POST-запросов от сайта для отправки уведомлений админам."""
+    # Обработка CORS preflight
+    if request.method == 'OPTIONS':
+        return web.Response(
+            headers={
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Methods': 'POST, OPTIONS',
+                'Access-Control-Allow-Headers': 'Content-Type, X-Notify-Secret',
+            }
+        )
+
     secret = request.headers.get("X-Notify-Secret")
     if secret != NOTIFY_SECRET:
-        return web.json_response({"error": "Unauthorized"}, status=401)
+        return web.json_response(
+            {"error": "Unauthorized"},
+            status=401,
+            headers={'Access-Control-Allow-Origin': '*'}
+        )
     
     try:
         data = await request.json()
@@ -873,7 +892,11 @@ async def notify_handler(request):
         date = data.get("date")
         
         if not all([user_id, username, user_name, date]):
-            return web.json_response({"error": "Missing fields"}, status=400)
+            return web.json_response(
+                {"error": "Missing fields"},
+                status=400,
+                headers={'Access-Control-Allow-Origin': '*'}
+            )
         
         admin_text = (
             "📩 <b>НОВАЯ ЗАЯВКА (с сайта)</b>\n"
@@ -899,11 +922,18 @@ async def notify_handler(request):
             except Exception as e:
                 logging.error(f"Не удалось отправить уведомление админу {admin_id}: {e}")
         
-        return web.json_response({"status": "ok", "sent": sent})
+        return web.json_response(
+            {"status": "ok", "sent": sent},
+            headers={'Access-Control-Allow-Origin': '*'}
+        )
     
     except Exception as e:
         logging.error(f"Ошибка в notify_handler: {e}")
-        return web.json_response({"error": str(e)}, status=500)
+        return web.json_response(
+            {"error": str(e)},
+            status=500,
+            headers={'Access-Control-Allow-Origin': '*'}
+        )
 
 # ===== ЗАПУСК =====
 async def on_startup(bot: Bot):
@@ -923,7 +953,8 @@ def main():
     webhook_requests_handler = SimpleRequestHandler(dispatcher=dp, bot=bot)
     webhook_requests_handler.register(app, path=WEBHOOK_PATH)
     app.router.add_get('/', health_check)
-    app.router.add_post('/notify', notify_handler)   # <-- ДОБАВЛЕН ЭНДПОИНТ
+    app.router.add_post('/notify', notify_handler)
+    app.router.add_options('/notify', notify_handler)  # для CORS preflight
 
     dp.startup.register(on_startup)
     setup_application(app, dp, bot=bot)
