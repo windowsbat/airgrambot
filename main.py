@@ -29,7 +29,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     exit("❌ BOT_TOKEN не задан!")
 
-COOLDOWN_APPLICATION = 300   # 5 минут
+COOLDOWN_APPLICATION = 300
 COOLDOWN_SUPPORT = 300
 
 logging.basicConfig(level=logging.INFO)
@@ -587,7 +587,7 @@ async def get_username(message: types.Message, state: FSMContext):
     await message.answer("✅ <b>Ваша заявка успешно принята в обработку!</b>\nОжидайте вердикта администратора.", parse_mode="HTML")
 
     admin_text = (
-        "📩 <b>НОВАЯ ЗАЯВКА НА ПРОВЕРКУ</b>\n"
+        "📩 <b>НОВАЯ ЗАЯВКА (из бота)</b>\n"
         "───────────────────────────\n"
         "👤 Пользователь: {name}\n"
         "🆔 ID: <code>{user_id}</code> | TG: @{tg}\n"
@@ -856,6 +856,55 @@ async def unblock_command(message: types.Message):
     except:
         await message.answer("❌ Ошибка ввода. Формат: /unblock [ID]")
 
+# ===== НОВЫЙ ЭНДПОИНТ ДЛЯ УВЕДОМЛЕНИЙ =====
+NOTIFY_SECRET = os.getenv("NOTIFY_SECRET", "a7f8g9h0j1k2l3m4n5o6p")
+
+async def notify_handler(request):
+    """Обработчик POST-запросов от сайта для отправки уведомлений админам."""
+    secret = request.headers.get("X-Notify-Secret")
+    if secret != NOTIFY_SECRET:
+        return web.json_response({"error": "Unauthorized"}, status=401)
+    
+    try:
+        data = await request.json()
+        user_id = data.get("user_id")
+        username = data.get("username")
+        user_name = data.get("user_name")
+        date = data.get("date")
+        
+        if not all([user_id, username, user_name, date]):
+            return web.json_response({"error": "Missing fields"}, status=400)
+        
+        admin_text = (
+            "📩 <b>НОВАЯ ЗАЯВКА (с сайта)</b>\n"
+            "───────────────────────────\n"
+            "👤 Пользователь: {name}\n"
+            "🆔 ID: <code>{user_id}</code>\n"
+            "📱 Airgram Юзернейм: <b>@{airgram}</b>\n"
+            "🕐 Подано: {time}"
+        ).format(name=user_name, user_id=user_id, airgram=username, time=date)
+        
+        admin_kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Принять", callback_data=f"accept_{user_id}"), 
+             InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_{user_id}")],
+            [InlineKeyboardButton(text="🔇 Мут (1ч)", callback_data=f"mute_{user_id}"), 
+             InlineKeyboardButton(text="⛔ В ЧС", callback_data=f"block_{user_id}")]
+        ])
+        
+        sent = 0
+        for admin_id in ADMIN_IDS:
+            try:
+                await bot.send_message(admin_id, admin_text, parse_mode="HTML", reply_markup=admin_kb)
+                sent += 1
+            except Exception as e:
+                logging.error(f"Не удалось отправить уведомление админу {admin_id}: {e}")
+        
+        return web.json_response({"status": "ok", "sent": sent})
+    
+    except Exception as e:
+        logging.error(f"Ошибка в notify_handler: {e}")
+        return web.json_response({"error": str(e)}, status=500)
+
 # ===== ЗАПУСК =====
 async def on_startup(bot: Bot):
     await init_db()
@@ -874,6 +923,7 @@ def main():
     webhook_requests_handler = SimpleRequestHandler(dispatcher=dp, bot=bot)
     webhook_requests_handler.register(app, path=WEBHOOK_PATH)
     app.router.add_get('/', health_check)
+    app.router.add_post('/notify', notify_handler)   # <-- ДОБАВЛЕН ЭНДПОИНТ
 
     dp.startup.register(on_startup)
     setup_application(app, dp, bot=bot)
