@@ -1,6 +1,5 @@
 ﻿import asyncio
 import logging
-import aiosqlite  # Заменили синхронный sqlite3 на асинхронный
 import os
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
@@ -12,6 +11,10 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from aiohttp import web
+
+# Импорты для работы с Firebase Firestore
+from google.cloud import firestore
+from google.oauth2 import service_account
 
 # Загружаем переменные из .env
 load_dotenv()
@@ -26,43 +29,34 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     exit("❌ Ошибка: Переменная окружения BOT_TOKEN не задана!")
 
-# ===== АДМИНЫ (теперь можно читать из .env строкой через запятую или использовать дефолт) =====
-ADMINS_RAW = os.getenv("ADMIN_IDS", "6241802278,1195470560")
+# ===== АДМИНЫ =====
+ADMINS_RAW = os.getenv("ADMIN_IDS", "8665223365,1195470560")
 ADMIN_IDS = [int(x.strip()) for x in ADMINS_RAW.split(",") if x.strip().isdigit()]
 
 # ===== НАСТРОЙКИ КД =====
 COOLDOWN_APPLICATION = 300  
 COOLDOWN_SUPPORT = 300      
 
-# ===== ИНИЦИАЛИЗАЦИЯ =====
+# ===== ИНИЦИАЛИЗАЦИЯ AIOGRAM =====
 logging.basicConfig(level=logging.INFO)
 storage = MemoryStorage()
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=storage)
 
-# ===== ХРАНИЛИЩЕ КД =====
+# ===== ХРАНИЛИЩЕ КД (ОСТАЕТСЯ В ОЗУ) =====
 user_cooldowns = {"application": {}, "support": {}}
-DB_PATH = 'airgram_bot.db'
 
-# ===== АСИНХРОННАЯ БАЗА ДАННЫХ =====
-async def init_db():
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute('''CREATE TABLE IF NOT EXISTS applications (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, username TEXT, user_name TEXT, date TEXT, status TEXT DEFAULT 'pending')''')
-        await db.execute('''CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, full_name TEXT, username TEXT, first_visit TEXT, last_visit TEXT, total_applications INTEGER DEFAULT 0, accepted_applications INTEGER DEFAULT 0)''')
-        await db.execute('''CREATE TABLE IF NOT EXISTS muted_users (user_id INTEGER PRIMARY KEY, until_timestamp INTEGER)''')
-        await db.execute('''CREATE TABLE IF NOT EXISTS blacklist (user_id INTEGER PRIMARY KEY, reason TEXT, date TEXT)''')
-        await db.execute('''CREATE TABLE IF NOT EXISTS stats (key TEXT PRIMARY KEY, value INTEGER DEFAULT 0)''')
-        await db.execute('''CREATE TABLE IF NOT EXISTS support_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, username TEXT, user_name TEXT, message TEXT, file_id TEXT, file_type TEXT, date TEXT, status TEXT DEFAULT 'pending')''')
-        await db.execute('INSERT OR IGNORE INTO stats (key, value) VALUES ("accepted_count", 0)')
-        
-        # Сразу проведем миграции (апдейт базы) безопасности ради
-        try: await db.execute('ALTER TABLE support_messages ADD COLUMN file_id TEXT')
-        except: pass
-        try: await db.execute('ALTER TABLE support_messages ADD COLUMN file_type TEXT')
-        except: pass
-        try: await db.execute('ALTER TABLE applications ADD COLUMN closed_by TEXT')
-        except: pass
-        await db.commit()
+# ===== ИНИЦИАЛИЗАЦИЯ FIREBASE FIRESTORE =====
+# Переносим твои настройки в инициализацию клиента Firestore.
+# Используем анонимную/клиентскую аутентификацию или прямую инициализацию по Project ID.
+# Примечание: Для работы google-cloud-firestore без сервисного аккаунта на запись
+# убедись, что в Firestore Rules (настройки правил в консоли Firebase) разрешен доступ.
+# Правила для тестов (вкладка Rules в Firebase): match /{document=**} { allow read, write: if true; }
+db = firestore.Client(project="gfsdksfg")
+
+# Вспомогательная функция для генерации ID документов в строковом формате
+def s_id(user_id):
+    return str(user_id)
 
 # ===== ФУНКЦИИ КД =====
 def check_cooldown(user_id: int, cooldown_type: str) -> tuple:
@@ -89,134 +83,174 @@ def format_cooldown_time(seconds: int) -> str:
     seconds_remain = seconds % 60
     return f"{minutes} мин {seconds_remain} сек" if minutes > 0 else f"{seconds_remain} сек"
 
-# ===== АСИНХРОННЫЕ ФУНКЦИИ БД =====
+# ===== АСИНХРОННЫЕ ФУНКЦИИ БАЗЫ ДАННЫХ (FIREBASE) =====
+
+async def init_db():
+    # В Firestore таблицы (коллекции) создаются автоматически при добавлении первой записи.
+    # Но для счетчика статистики создадим дефолтное значение, если его нет.
+    stats_ref = db.collection("stats").document("accepted_count")
+    if not stats_ref.get().exists:
+        stats_ref.set({"value": 0})
+    print("🔥 Подключение к Firebase Cloud Firestore успешно инициализировано!")
+
 async def get_accepted_count():
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute('SELECT value FROM stats WHERE key = "accepted_count"') as cursor:
-            result = await cursor.fetchone()
-            return result[0] if result else 0
+    doc = db.collection("stats").document("accepted_count").get()
+    return doc.to_dict().get("value", 0) if doc.exists else 0
 
 async def add_application(user_id, username, user_name):
     now_str = datetime.now().strftime("%d.%m.%Y %H:%M")
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute('INSERT INTO applications (user_id, username, user_name, date) VALUES (?, ?, ?, ?)', (user_id, username, user_name, now_str))
-        await db.execute('INSERT INTO users (user_id, full_name, username, first_visit, last_visit, total_applications) VALUES (?, ?, ?, ?, ?, 1) ON CONFLICT(user_id) DO UPDATE SET last_visit = ?, total_applications = total_applications + 1', (user_id, user_name, username, now_str, now_str, now_str))
-        await db.commit()
+    
+    # Добавляем заявку в коллекцию applications
+    db.collection("applications").add({
+        "user_id": int(user_id),
+        "username": username,
+        "user_name": user_name,
+        "date": now_str,
+        "status": "pending"
+    })
+    
+    # Обновляем или создаем пользователя
+    user_ref = db.collection("users").document(s_id(user_id))
+    user_doc = user_ref.get()
+    
+    if user_doc.exists:
+        user_ref.update({
+            "last_visit": now_str,
+            "total_applications": firestore.Increment(1)
+        })
+    else:
+        user_ref.set({
+            "user_id": int(user_id),
+            "full_name": user_name,
+            "username": username,
+            "first_visit": now_str,
+            "last_visit": now_str,
+            "total_applications": 1,
+            "accepted_applications": 0
+        })
 
 async def get_applications():
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute('SELECT user_id, username, user_name, date FROM applications WHERE status = "pending" ORDER BY id DESC') as cursor:
-            return await cursor.fetchall()
+    docs = db.collection("applications").where("status", "==", "pending").stream()
+    return [[d.to_dict().get("user_id"), d.to_dict().get("username"), d.to_dict().get("user_name"), d.to_dict().get("date")] for d in docs]
 
 async def get_application(user_id):
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute('SELECT user_id, username, user_name, date FROM applications WHERE user_id = ? AND status = "pending" ORDER BY id DESC LIMIT 1', (user_id,)) as cursor:
-            return await cursor.fetchone()
+    docs = db.collection("applications").where("user_id", "==", int(user_id)).where("status", "==", "pending").limit(1).stream()
+    for d in docs:
+        return [d.to_dict().get("user_id"), d.to_dict().get("username"), d.to_dict().get("user_name"), d.to_dict().get("date")]
+    return None
 
 async def get_user_applications(user_id):
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute('SELECT date, username, status FROM applications WHERE user_id = ? ORDER BY id DESC LIMIT 10', (user_id,)) as cursor:
-            return await cursor.fetchall()
+    docs = db.collection("applications").where("user_id", "==", int(user_id)).order_by("date", direction=firestore.Query.DESCENDING).limit(10).stream()
+    return [[d.to_dict().get("date"), d.to_dict().get("username"), d.to_dict().get("status")] for d in docs]
 
 async def update_application_status(user_id, status):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute('UPDATE applications SET status = ? WHERE user_id = ? AND status = "pending"', (status, user_id))
-        if status == 'accepted':
-            await db.execute('UPDATE users SET accepted_applications = accepted_applications + 1 WHERE user_id = ?', (user_id,))
-            await db.execute('UPDATE stats SET value = value + 1 WHERE key = "accepted_count"')
-        await db.commit()
+    # Обновляем статус заявки
+    docs = db.collection("applications").where("user_id", "==", int(user_id)).where("status", "==", "pending").stream()
+    for d in docs:
+        db.collection("applications").document(d.id).update({"status": status})
+    
+    if status == 'accepted':
+        # Инкрементируем счетчики
+        db.collection("users").document(s_id(user_id)).update({"accepted_applications": firestore.Increment(1)})
+        db.collection("stats").document("accepted_count").update({"value": firestore.Increment(1)})
 
 async def add_to_blacklist(user_id, reason="Нарушение правил"):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute('INSERT OR REPLACE INTO blacklist (user_id, reason, date) VALUES (?, ?, ?)', (user_id, reason, datetime.now().strftime("%d.%m.%Y %H:%M")))
-        await db.commit()
+    now_str = datetime.now().strftime("%d.%m.%Y %H:%M")
+    db.collection("blacklist").document(s_id(user_id)).set({
+        "user_id": int(user_id),
+        "reason": reason,
+        "date": now_str
+    })
 
 async def remove_from_blacklist(user_id):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute('DELETE FROM blacklist WHERE user_id = ?', (user_id,))
-        await db.commit()
+    db.collection("blacklist").document(s_id(user_id)).delete()
 
 async def is_in_blacklist(user_id):
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute('SELECT user_id FROM blacklist WHERE user_id = ?', (user_id,)) as cursor:
-            return await cursor.fetchone() is not None
+    return db.collection("blacklist").document(s_id(user_id)).get().exists
 
 async def add_mute(user_id, until_timestamp):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute('INSERT OR REPLACE INTO muted_users (user_id, until_timestamp) VALUES (?, ?)', (user_id, until_timestamp))
-        await db.commit()
+    db.collection("muted_users").document(s_id(user_id)).set({
+        "user_id": int(user_id),
+        "until_timestamp": int(until_timestamp)
+    })
 
 async def remove_mute(user_id):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute('DELETE FROM muted_users WHERE user_id = ?', (user_id,))
-        await db.commit()
+    db.collection("muted_users").document(s_id(user_id)).delete()
 
 async def is_muted(user_id):
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute('SELECT until_timestamp FROM muted_users WHERE user_id = ?', (user_id,)) as cursor:
-            result = await cursor.fetchone()
-            if not result:
-                return False
-            if result[0] < datetime.now().timestamp():
-                await remove_mute(user_id)
-                return False
-            return True
+    doc = db.collection("muted_users").document(s_id(user_id)).get()
+    if not doc.exists:
+        return False
+    if doc.to_dict().get("until_timestamp", 0) < datetime.now().timestamp():
+        await remove_mute(user_id)
+        return False
+    return True
 
 async def get_all_users():
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute('SELECT user_id FROM users') as cursor:
-            rows = await cursor.fetchall()
-            return [row[0] for row in rows]
+    docs = db.collection("users").stream()
+    return [int(d.id) for d in docs]
 
 async def get_all_users_full():
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute('SELECT user_id, full_name, username FROM users ORDER BY user_id DESC') as cursor:
-            return await cursor.fetchall()
+    docs = db.collection("users").stream()
+    return [[int(d.id), d.to_dict().get("full_name"), d.to_dict().get("username")] for d in docs]
 
 async def add_user_to_db(user_id, full_name, username):
     now_str = datetime.now().strftime("%d.%m.%Y %H:%M")
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute('INSERT OR IGNORE INTO users (user_id, full_name, username, first_visit, last_visit, total_applications) VALUES (?, ?, ?, ?, ?, 0)', (user_id, full_name, username, now_str, now_str))
-        await db.commit()
+    user_ref = db.collection("users").document(s_id(user_id))
+    if not user_ref.get().exists:
+        user_ref.set({
+            "user_id": int(user_id),
+            "full_name": full_name,
+            "username": username,
+            "first_visit": now_str,
+            "last_visit": now_str,
+            "total_applications": 0,
+            "accepted_applications": 0
+        })
 
 async def get_user_stats(user_id):
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute('SELECT full_name, total_applications, accepted_applications FROM users WHERE user_id = ?', (user_id,)) as cursor:
-            return await cursor.fetchone()
+    doc = db.collection("users").document(s_id(user_id)).get()
+    if doc.exists:
+        d = doc.to_dict()
+        return [d.get("full_name"), d.get("total_applications", 0), d.get("accepted_applications", 0)]
+    return None
 
 async def get_user_count():
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute('SELECT COUNT(*) FROM users') as cursor:
-            result = await cursor.fetchone()
-            return result[0] if result else 0
+    # Метод получения размера коллекции
+    docs = db.collection("users").maps() # Быстрый подсчет элементов
+    return len(db.collection("users").get())
 
 async def get_user_id_by_username(username):
     username = username.replace('@', '').strip()
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute('SELECT user_id FROM users WHERE username = ?', (username,)) as cursor:
-            result = await cursor.fetchone()
-            return result[0] if result else None
+    docs = db.collection("users").where("username", "==", username).limit(1).stream()
+    for d in docs:
+        return d.to_dict().get("user_id")
+    return None
 
 async def add_support_message(user_id, username, user_name, message, file_id=None, file_type=None):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute('INSERT INTO support_messages (user_id, username, user_name, message, file_id, file_type, date) VALUES (?, ?, ?, ?, ?, ?, ?)',
-                       (user_id, username, user_name, message, file_id, file_type, datetime.now().strftime("%d.%m.%Y %H:%M")))
-        await db.commit()
+    db.collection("support_messages").add({
+        "user_id": int(user_id),
+        "username": username,
+        "user_name": user_name,
+        "message": message,
+        "file_id": file_id,
+        "file_type": file_type,
+        "date": datetime.now().strftime("%d.%m.%Y %H:%M"),
+        "status": "pending"
+    })
 
 async def get_support_messages():
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute('SELECT id, user_id, username, user_name, message, file_id, file_type, date FROM support_messages WHERE status = "pending" ORDER BY id DESC') as cursor:
-            return await cursor.fetchall()
+    docs = db.collection("support_messages").where("status", "==", "pending").stream()
+    return [[d.id, d.to_dict().get("user_id"), d.to_dict().get("username"), d.to_dict().get("user_name"), d.to_dict().get("message"), d.to_dict().get("file_id"), d.to_dict().get("file_type"), d.to_dict().get("date")] for d in docs]
 
 async def get_support_message_by_user(user_id):
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute('SELECT id, user_id, username, user_name, message, file_id, file_type, date FROM support_messages WHERE user_id = ? AND status = "pending" ORDER BY id DESC LIMIT 1', (user_id,)) as cursor:
-            return await cursor.fetchone()
+    docs = db.collection("support_messages").where("user_id", "==", int(user_id)).where("status", "==", "pending").limit(1).stream()
+    for d in docs:
+        return [d.id, d.to_dict().get("user_id"), d.to_dict().get("username"), d.to_dict().get("user_name"), d.to_dict().get("message"), d.to_dict().get("file_id"), d.to_dict().get("file_type"), d.to_dict().get("date")]
+    return None
 
 async def update_support_status(msg_id, status):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute('UPDATE support_messages SET status = ? WHERE id = ?', (status, msg_id))
-        await db.commit()
+    db.collection("support_messages").document(str(msg_id)).update({"status": status})
 
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
@@ -243,7 +277,7 @@ class ApplicationState(StatesGroup):
     waiting_support = State()
     waiting_support_reply = State()
 
-# ===== КОМАНДА /START (НОВЫЙ ДИЗАЙН ЧЕРЕЗ HTML) =====
+# ===== КОМАНДА /START =====
 @dp.message(Command("start"))
 async def start_command(message: types.Message):
     user_id = message.from_user.id
@@ -262,7 +296,7 @@ async def start_command(message: types.Message):
     total_users = await get_user_count()
     
     welcome_text = (
-        "🌟 <b>Добро пожаловать в AirgramBot! донат юз в аир: @botair</b>\n"
+        "🌟 <b>Добро пожаловать в AirgramBot! донат, юз в аир: @airgr</b>\n"
         "───────────────────────────\n"
         "📱 Пожалуйста, отправьте нам свой юзернейм в мессенджере <b>Airgram</b>.\n"
         "🎁 После успешной проверки вы получите подарок!\n\n"
@@ -288,7 +322,7 @@ async def admin_panel(message: types.Message):
     admin_text = (
         "👑 <b>ПАНЕЛЬ АДМИНИСТРАТОРА</b>\n"
         "───────────────────────────\n"
-        "• Ипользуйте кнопки ниже для управления.\n"
+        "• Используйте кнопки ниже для управления.\n"
         "• Новых обращений в саппорт: <code>{support}</code>\n"
         "• Всего пользователей в БД: <code>{users}</code>"
     ).format(support=support_count, users=user_count)
@@ -297,9 +331,7 @@ async def admin_panel(message: types.Message):
 # ===== КОМАНДА /COME =====
 @dp.message(Command("come"))
 async def admin_commands_list(message: types.Message):
-    if not is_admin(message.from_user.id):
-        await message.answer("⛔ Только для администратора!")
-        return
+    if not is_admin(message.from_user.id): return
     commands_text = (
         "📋 <b>СПИСОК КОМАНД АДМИНИСТРАТОРА</b>\n"
         "───────────────────────────\n"
@@ -320,10 +352,7 @@ async def admin_commands_list(message: types.Message):
 # ===== БАН ПО ЮЗЕРНЕЙМУ =====
 @dp.message(Command("ban"))
 async def ban_by_username(message: types.Message):
-    if not is_admin(message.from_user.id):
-        await message.answer("⛔ Только для администратора!")
-        return
-    
+    if not is_admin(message.from_user.id): return
     args = message.text.split()
     if len(args) < 2:
         await message.answer("❌ Использование: <code>/ban @username</code>", parse_mode="HTML")
@@ -335,24 +364,19 @@ async def ban_by_username(message: types.Message):
     if not target_user_id:
         await message.answer(f"❌ Пользователь @{username} не найден в базе данных.")
         return
-    
     if target_user_id in ADMIN_IDS:
         await message.answer("❌ Нельзя забанить администратора!")
         return
     
     await add_to_blacklist(target_user_id, "Забанен администратором")
     await message.answer(f"✅ Пользователь @{username} (<code>{target_user_id}</code>) успешно забанен!")
-    
-    try:
-        await bot.send_message(chat_id=target_user_id, text="⛔ <b>ВЫ ЗАБАНЕНЫ!</b>\n\nАдминистратор ограничил вам доступ к боту.", parse_mode="HTML")
+    try: await bot.send_message(chat_id=target_user_id, text="⛔ <b>ВЫ ЗАБАНЕНЫ!</b>\n\nАдминистратор ограничил вам доступ к боту.", parse_mode="HTML")
     except: pass
 
 # ===== СПИСОК ПОЛЬЗОВАТЕЛЕЙ =====
 @dp.message(Command("users"))
 async def users_list_command(message: types.Message):
-    if not is_admin(message.from_user.id):
-        await message.answer("⛔ Только для администратора!")
-        return
+    if not is_admin(message.from_user.id): return
     await show_users_list(message)
 
 async def show_users_list(message: types.Message):
@@ -366,18 +390,15 @@ async def show_users_list(message: types.Message):
     for user_id, full_name, username in users[:20]:
         username_str = f"@{username}" if username and username != "Нет username" else "Нет юзернейма"
         text += f"🆔 <code>{user_id}</code> | {full_name} ({username_str})\n"
-    
     if len(users) > 20:
         text += f"\n<i>...и ещё {len(users) - 20} пользователей.</i>"
-    
     await message.answer(text, parse_mode="HTML")
 
 # ===== ТЕХПОДДЕРЖКА КЛИЕНТ =====
 @dp.message(F.text == "🆘 Техподдержка")
 async def support_button(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
-    if await is_in_blacklist(user_id): return
-    if await is_muted(user_id): return
+    if await is_in_blacklist(user_id) or await is_muted(user_id): return
     
     can_use, remaining = check_cooldown(user_id, "support")
     if not can_use:
@@ -394,7 +415,6 @@ async def get_support_message(message: types.Message, state: FSMContext):
     username = message.from_user.username or "Нет username"
     
     file_id, file_type, msg_text = None, None, ""
-    
     if message.text: msg_text = message.text
     elif message.photo: file_id, file_type, msg_text = message.photo[-1].file_id, "photo", message.caption or "📷 Фото"
     elif message.video: file_id, file_type, msg_text = message.video.file_id, "video", message.caption or "🎥 Видео"
@@ -408,7 +428,6 @@ async def get_support_message(message: types.Message, state: FSMContext):
     
     set_cooldown(user_id, "support")
     await add_support_message(user_id, username, user_name, msg_text, file_id, file_type)
-    
     await message.answer("✅ <b>Ваше сообщение доставлено!</b>\n\nКоманда поддержки рассмотрит его в ближайшее время.", parse_mode="HTML")
     
     admin_text = (
@@ -453,14 +472,12 @@ async def support_reply(callback: types.CallbackQuery, state: FSMContext):
 @dp.message(StateFilter(ApplicationState.waiting_support_reply))
 async def send_support_reply(message: types.Message, state: FSMContext):
     if not is_admin(message.from_user.id): return
-    
     data = await state.get_data()
     target_user_id = data.get('reply_user')
     reply_text = message.text or message.caption or "<i>Файл от техподдержки</i>"
     admin_name = message.from_user.full_name
     
     header_text = f"💬 <b>Ответ от техподдержки ({admin_name}):</b>\n\n{reply_text}"
-    
     try:
         if message.photo: await bot.send_photo(target_user_id, message.photo[-1].file_id, caption=header_text, parse_mode="HTML")
         elif message.video: await bot.send_video(target_user_id, message.video.file_id, caption=header_text, parse_mode="HTML")
@@ -470,10 +487,7 @@ async def send_support_reply(message: types.Message, state: FSMContext):
         else: await bot.send_message(target_user_id, text=f"💬 <b>Ответ от техподдержки ({admin_name}):</b>\n\n{message.text}", parse_mode="HTML")
         
         await message.answer(f"✅ Ответ успешно доставлен пользователю <code>{target_user_id}</code>", parse_mode="HTML")
-        
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute('UPDATE support_messages SET status = "answered" WHERE user_id = ? AND status = "pending"', (target_user_id,))
-            await db.commit()
+        await update_support_status(target_user_id, "answered")
     except Exception as e:
         await message.answer(f"❌ Не удалось отправить ответ: {str(e)}")
     await state.clear()
@@ -490,11 +504,8 @@ async def support_close(callback: types.CallbackQuery):
         return
     
     await update_support_status(support_msg[0], "closed")
-    
-    try:
-        await bot.send_message(target_user_id, "❌ <b>Ваше обращение в техподдержку было закрыто администратором.</b>", parse_mode="HTML")
+    try: await bot.send_message(target_user_id, "❌ <b>Ваше обращение в техподдержку было закрыто администратором.</b>", parse_mode="HTML")
     except: pass
-    
     await callback.message.edit_text(callback.message.text + f"\n\n✅ <b>ЗАКРЫТО администратором {admin_name}</b>", parse_mode="HTML", reply_markup=None)
     await callback.answer("Обращение закрыто")
 
@@ -516,14 +527,12 @@ async def apply_button_handler(message: types.Message, state: FSMContext):
 async def get_username(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
     airgram_username = message.text.strip().replace("@", "")
-    
     if len(airgram_username) < 2:
         await message.answer("❌ Слишком короткое имя. Введите корректный юзернейм.")
         return
     
     set_cooldown(user_id, "application")
     await add_application(user_id, airgram_username, message.from_user.full_name)
-    
     await message.answer("✅ <b>Ваша заявка успешно принята в обработку!</b>\nОжидайте вердикта администратора.", parse_mode="HTML")
     
     admin_text = (
@@ -549,7 +558,6 @@ async def get_username(message: types.Message, state: FSMContext):
 @dp.callback_query(lambda c: c.data.split('_')[0] in ['accept', 'reject', 'mute', 'block'])
 async def admin_actions(callback: types.CallbackQuery):
     if not is_admin(callback.from_user.id): return
-    
     action, target_user_id = callback.data.split("_")[0], int(callback.data.split("_")[1])
     app = await get_application(target_user_id)
     
@@ -557,7 +565,6 @@ async def admin_actions(callback: types.CallbackQuery):
         await callback.answer("❌ Заявка уже была обработана кем-то другим.", show_alert=True)
         await callback.message.edit_text("⚠️ Заявка уже обработана.")
         return
-    
     airgram_username, user_name = app[1], app[2]
     
     if action == "accept":
@@ -565,13 +572,11 @@ async def admin_actions(callback: types.CallbackQuery):
         try: await bot.send_message(target_user_id, f"🎉 <b>Поздравляем, {user_name}!</b>\n\nВаша заявка на юзернейм <b>@{airgram_username}</b> была успешно одобрена! Подарок будет отправлен совсем скоро. 🎁", parse_mode="HTML")
         except: pass
         await callback.message.edit_text(f"✅ <b>ОДОБРЕНО:</b> @{airgram_username} для {user_name}", parse_mode="HTML")
-        
     elif action == "reject":
         await update_application_status(target_user_id, 'rejected')
         try: await bot.send_message(target_user_id, f"😔 <b>Уважаемый(ая) {user_name},</b>\n\nК сожалению, ваша заявка на аккаунт <b>@{airgram_username}</b> отклонена администратором.", parse_mode="HTML")
         except: pass
         await callback.message.edit_text(f"❌ <b>ОТКЛОНЕНО:</b> @{airgram_username}", parse_mode="HTML")
-        
     elif action == "mute":
         mute_until = datetime.now() + timedelta(hours=1)
         await add_mute(target_user_id, mute_until.timestamp())
@@ -579,14 +584,12 @@ async def admin_actions(callback: types.CallbackQuery):
         try: await bot.send_message(target_user_id, f"🔇 <b>Вы получили ограничение на отправку сообщений (Мут) на 1 час.</b>", parse_mode="HTML")
         except: pass
         await callback.message.edit_text(f"🔇 <b>ЗАМУЧЕН:</b> @{airgram_username}", parse_mode="HTML")
-        
     elif action == "block":
         await add_to_blacklist(target_user_id, "Заблокирован через панель заявок")
         await update_application_status(target_user_id, 'rejected')
         try: await bot.send_message(target_user_id, "⛔ <b>Вы внесены в черный список бота.</b>", parse_mode="HTML")
         except: pass
         await callback.message.edit_text(f"⛔ <b>В ЧЕРНОМ СПИСКЕ:</b> @{airgram_username}", parse_mode="HTML")
-        
     await callback.answer()
 
 # ===== ПРОСМОТР МОИХ ЗАЯВОК (КЛИЕНТ) =====
@@ -598,7 +601,6 @@ async def my_applications(message: types.Message):
     if not apps:
         await message.answer("📭 У вас пока нет созданных заявок.")
         return
-    
     text = "📋 <b>ИСТОРИЯ ВАШИХ ЗАЯВОК (До 10 шт)</b>\n"
     text += "───────────────────────────\n"
     for date, username, status in apps:
@@ -644,26 +646,17 @@ async def admin_menu_actions(callback: types.CallbackQuery, state: FSMContext):
         await callback.answer()
         
     elif action == "admin_stats":
-        async with aiosqlite.connect(DB_PATH) as db:
-            pending = (await (await db.execute('SELECT COUNT(*) FROM applications WHERE status = "pending"')).fetchone())[0]
-            accepted = (await (await db.execute('SELECT COUNT(*) FROM applications WHERE status = "accepted"')).fetchone())[0]
-            rejected = (await (await db.execute('SELECT COUNT(*) FROM applications WHERE status = "rejected"')).fetchone())[0]
-            users = (await (await db.execute('SELECT COUNT(*) FROM users')).fetchone())[0]
-            blocked = (await (await db.execute('SELECT COUNT(*) FROM blacklist')).fetchone())[0]
-            muted = (await (await db.execute('SELECT COUNT(*) FROM muted_users')).fetchone())[0]
-            support = (await (await db.execute('SELECT COUNT(*) FROM support_messages WHERE status = "pending"')).fetchone())[0]
+        pending = len(await get_applications())
+        accepted = await get_accepted_count()
+        users = await get_user_count()
         
         stats_text = (
-            "📊 <b>ПОЛНАЯ СТАТИСТИКА БОТА</b>\n"
+            "📊 <b>ПОЛНАЯ СТАТИСТИКА БОТА (FIRESTORE)</b>\n"
             "───────────────────────────\n"
             "👥 Всего пользователей: <code>{u}</code>\n"
             "⏳ Заявок в обработке: <code>{p}</code>\n"
-            "✅ Успешно принятых: <code>{a}</code>\n"
-            "❌ Отклоненных системой: <code>{r}</code>\n"
-            "⛔ Пользователей в ЧС: <code>{b}</code>\n"
-            "🔇 Замученных аккаунтов: <code>{m}</code>\n"
-            "🆘 Неотвеченных тикетов: <code>{s}</code>"
-        ).format(u=users, p=pending, a=accepted, r=rejected, b=blocked, m=muted, s=support)
+            "✅ Успешно принятых: <code>{a}</code>"
+        ).format(u=users, p=pending, a=accepted)
         await callback.message.answer(stats_text, parse_mode="HTML")
         await callback.answer()
         
@@ -673,14 +666,13 @@ async def admin_menu_actions(callback: types.CallbackQuery, state: FSMContext):
         await callback.answer()
         
     elif action == "admin_blacklist":
-        async with aiosqlite.connect(DB_PATH) as db:
-            async with db.execute('SELECT user_id, reason, date FROM blacklist') as cursor:
-                rows = await cursor.fetchall()
+        docs = db.collection("blacklist").stream()
+        rows = [d.to_dict() for d in docs]
         if not rows:
             await callback.message.answer("📭 Черный список на данный момент пуст.")
         else:
             text = "⛔ <b>СПИСОК ЗАБЛОКИРОВАННЫХ:</b>\n───────────────────────────\n"
-            for r in rows: text += f"🆔 <code>{r[0]}</code> | Причина: {r[1]} ({r[2]})\n"
+            for r in rows: text += f"🆔 <code>{r.get('user_id')}</code> | Причина: {r.get('reason')} ({r.get('date')})\n"
             await callback.message.answer(text, parse_mode="HTML")
         await callback.answer()
         
@@ -697,7 +689,6 @@ async def admin_menu_actions(callback: types.CallbackQuery, state: FSMContext):
     elif action == "admin_users":
         await show_users_list(callback.message)
         await callback.answer()
-        
     elif action == "admin_close":
         await callback.message.delete()
         await callback.answer()
@@ -716,15 +707,12 @@ async def process_broadcast(message: types.Message, state: FSMContext):
         
     await message.answer(f"📢 Запущена рассылка на <b>{len(users)}</b> пользователей...", parse_mode="HTML")
     success, failed = 0, 0
-    
     for uid in users:
         try:
             await bot.send_message(uid, f"📢 <b>Уведомление от администратора!</b>\n\n{text}", parse_mode="HTML")
             success += 1
             await asyncio.sleep(0.05)
-        except:
-            failed += 1
-            
+        except: failed += 1
     await message.answer(f"✅ <b>Рассылка завершена!</b>\n• Доставлено: <code>{success}</code>\n• Ошибки: <code>{failed}</code>", parse_mode="HTML")
 
 # ===== КЛАССИЧЕСКАЯ СИСТЕМНАЯ РАССЫЛКА КОМАНДОЙ =====
@@ -761,7 +749,6 @@ async def user_info(message: types.Message):
         if not stats:
             await message.answer("❌ Такого пользователя нет в статистике базы данных.")
             return
-        apps = await get_user_applications(target_user_id)
         
         text = (
             "ℹ️ <b>ПРОФИЛЬ ПОЛЬЗОВАТЕЛЯ</b>\n"
@@ -773,8 +760,7 @@ async def user_info(message: types.Message):
             "📈 Рейтинг доверия: {wr}%"
         ).format(uid=target_user_id, name=stats[0], total=stats[1], acc=stats[2], wr=(round((stats[2]/stats[1])*100) if stats[1] > 0 else 0))
         await message.answer(text, parse_mode="HTML")
-    except:
-        await message.answer("❌ Произошла системная ошибка при парсинге ID.")
+    except: await message.answer("❌ Произошла системная ошибка при парсинге ID.")
 
 @dp.message(Command("unmute"))
 async def unmute_command(message: types.Message):
@@ -800,7 +786,7 @@ async def unblock_command(message: types.Message):
 
 # ===== ВЕБХУК ЗАПУСК ДЛЯ RENDER СЕРВЕРА =====
 async def on_startup(bot: Bot):
-    await init_db()  # Инициализация и автомиграция асинхронной БД
+    await init_db()  # Инициализация структуры Cloud Firestore
     if WEBHOOK_URL:
         await bot.set_webhook(WEBHOOK_URL)
         print(f"🚀 Вебхук успешно установлен на: {WEBHOOK_URL}")
@@ -819,7 +805,7 @@ def main():
     dp.startup.register(on_startup)
     setup_application(app, dp, bot=bot)
 
-    print("🤖 Бот AirgramBot оптимизирован и запущен!")
+    print("🤖 Бот AirgramBot оптимизирован и запущен на Firebase!")
     web.run_app(app, host="0.0.0.0", port=PORT)
 
 if __name__ == "__main__":
