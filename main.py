@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import os
-import json  # добавлен для парсинга credentials
+import json  # добавлен для парсинга JSON-ключа
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, types, F
@@ -47,35 +47,53 @@ dp = Dispatcher(storage=storage)
 # ===== ХРАНИЛИЩЕ КД (ОСТАЕТСЯ В ОЗУ) =====
 user_cooldowns = {"application": {}, "support": {}}
 
-# ===== ИНИЦИАЛИЗАЦИЯ FIREBASE FIRESTORE С УЧЁТНЫМИ ДАННЫМИ =====
-FIREBASE_PROJECT = os.getenv("FIREBASE_PROJECT_ID", "gfsdksfg")  # ID вашего проекта
+# ===== ИНИЦИАЛИЗАЦИЯ FIREBASE FIRESTORE С ПОДДЕРЖКОЙ ВАШЕЙ ПЕРЕМЕННОЙ =====
+FIREBASE_PROJECT = os.getenv("FIREBASE_PROJECT_ID", "gfsdksfg")
 
 def init_firestore():
     """
-    Инициализация клиента Firestore.
-    Сначала пробует использовать переменную окружения FIREBASE_CREDENTIALS (JSON-строка),
-    затем стандартный механизм ADC (GOOGLE_APPLICATION_CREDENTIALS).
+    Инициализация клиента Firestore с поддержкой нескольких способов задания учётных данных.
+    Приоритет:
+    1. GOOGLE_APPLICATION_CREDENTIALS_JSON (содержимое JSON-ключа)
+    2. FIREBASE_CREDENTIALS (то же самое, для обратной совместимости)
+    3. GOOGLE_APPLICATION_CREDENTIALS (путь к файлу JSON)
+    4. Стандартный ADC (если настроен)
     """
-    creds_json = os.getenv("FIREBASE_CREDENTIALS")
+    # Пытаемся получить JSON из переменной
+    creds_json = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON") or os.getenv("FIREBASE_CREDENTIALS")
     if creds_json:
         try:
             creds_info = json.loads(creds_json)
             credentials = service_account.Credentials.from_service_account_info(creds_info)
             project = creds_info.get("project_id", FIREBASE_PROJECT)
-            logging.info("✅ Firestore инициализирован через FIREBASE_CREDENTIALS")
+            logging.info("✅ Firestore инициализирован через GOOGLE_APPLICATION_CREDENTIALS_JSON")
             return firestore.Client(project=project, credentials=credentials)
         except Exception as e:
-            logging.error(f"❌ Ошибка загрузки FIREBASE_CREDENTIALS: {e}")
+            logging.error(f"❌ Ошибка загрузки JSON-ключа: {e}")
 
-    # Если не задана FIREBASE_CREDENTIALS, пробуем стандартный путь (ADC)
+    # Если задан путь к файлу
+    creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+    if creds_path and os.path.exists(creds_path):
+        try:
+            # Библиотека сама подхватит файл, если установлена переменная
+            os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = creds_path
+            logging.info(f"✅ Firestore инициализирован через файл: {creds_path}")
+            return firestore.Client(project=FIREBASE_PROJECT)
+        except Exception as e:
+            logging.error(f"❌ Ошибка загрузки файла учётных данных: {e}")
+
+    # Пробуем стандартный ADC (если, например, переменная GOOGLE_APPLICATION_CREDENTIALS уже задана)
     try:
-        # Если переменная GOOGLE_APPLICATION_CREDENTIALS указывает на файл, он будет найден автоматически
         db = firestore.Client(project=FIREBASE_PROJECT)
-        logging.info("✅ Firestore инициализирован через ADC (GOOGLE_APPLICATION_CREDENTIALS)")
+        logging.info("✅ Firestore инициализирован через ADC")
         return db
     except Exception as e:
         logging.error(f"❌ Ошибка инициализации Firestore через ADC: {e}")
-        raise RuntimeError("Не удалось инициализировать Firestore. Убедитесь, что задана FIREBASE_CREDENTIALS или GOOGLE_APPLICATION_CREDENTIALS.")
+        raise RuntimeError(
+            "Не удалось инициализировать Firestore. "
+            "Убедитесь, что задана одна из переменных: "
+            "GOOGLE_APPLICATION_CREDENTIALS_JSON, FIREBASE_CREDENTIALS или GOOGLE_APPLICATION_CREDENTIALS (путь к файлу)."
+        )
 
 db = init_firestore()
 
@@ -111,8 +129,6 @@ def format_cooldown_time(seconds: int) -> str:
 # ===== АСИНХРОННЫЕ ФУНКЦИИ БАЗЫ ДАННЫХ (FIREBASE) =====
 
 async def init_db():
-    # В Firestore коллекции создаются автоматически при добавлении первой записи.
-    # Для счетчика статистики создадим дефолтное значение, если его нет.
     stats_ref = db.collection("stats").document("accepted_count")
     if not stats_ref.get().exists:
         stats_ref.set({"value": 0})
@@ -124,8 +140,6 @@ async def get_accepted_count():
 
 async def add_application(user_id, username, user_name):
     now_str = datetime.now().strftime("%d.%m.%Y %H:%M")
-    
-    # Добавляем заявку в коллекцию applications
     db.collection("applications").add({
         "user_id": int(user_id),
         "username": username,
@@ -133,11 +147,8 @@ async def add_application(user_id, username, user_name):
         "date": now_str,
         "status": "pending"
     })
-    
-    # Обновляем или создаем пользователя
     user_ref = db.collection("users").document(s_id(user_id))
     user_doc = user_ref.get()
-    
     if user_doc.exists:
         user_ref.update({
             "last_visit": now_str,
@@ -172,7 +183,6 @@ async def update_application_status(user_id, status):
     docs = db.collection("applications").where("user_id", "==", int(user_id)).where("status", "==", "pending").stream()
     for d in docs:
         db.collection("applications").document(d.id).update({"status": status})
-    
     if status == 'accepted':
         db.collection("users").document(s_id(user_id)).update({"accepted_applications": firestore.Increment(1)})
         db.collection("stats").document("accepted_count").update({"value": firestore.Increment(1)})
@@ -239,7 +249,7 @@ async def get_user_stats(user_id):
     return None
 
 async def get_user_count():
-    # Быстрый подсчет количества документов в коллекции
+    # Простой подсчёт документов в коллекции
     return len(db.collection("users").get())
 
 async def get_user_id_by_username(username):
@@ -808,7 +818,7 @@ async def unblock_command(message: types.Message):
 
 # ===== ВЕБХУК ЗАПУСК ДЛЯ RENDER СЕРВЕРА =====
 async def on_startup(bot: Bot):
-    await init_db()  # Инициализация структуры Cloud Firestore
+    await init_db()
     if WEBHOOK_URL:
         await bot.set_webhook(WEBHOOK_URL)
         print(f"🚀 Вебхук успешно установлен на: {WEBHOOK_URL}")
