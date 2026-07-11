@@ -911,6 +911,19 @@ async def notify_handler(request):
         logging.error(f"Ошибка в notify_handler: {e}")
         return web.json_response({"error": str(e)}, status=500)
 
+# ===== CORS MIDDLEWARE =====
+@web.middleware
+async def cors_middleware(request, handler):
+    if request.method == 'OPTIONS':
+        response = web.Response()
+        response.headers['Access-Control-Allow-Origin'] = '*'
+        response.headers['Access-Control-Allow-Methods'] = 'POST, GET, OPTIONS'
+        response.headers['Access-Control-Allow-Headers'] = 'Content-Type, X-Notify-Secret'
+        return response
+    response = await handler(request)
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    return response
+
 # ===== ЗАПУСК =====
 async def on_startup(bot: Bot):
     await init_db()
@@ -925,7 +938,7 @@ async def health_check(request):
     return web.Response(text="Я живой и я работаю!", status=200)
 
 def main():
-    app = web.Application()
+    app = web.Application(middlewares=[cors_middleware])  # <-- добавляем CORS
     webhook_requests_handler = SimpleRequestHandler(dispatcher=dp, bot=bot)
     webhook_requests_handler.register(app, path=WEBHOOK_PATH)
     app.router.add_get('/', health_check)
@@ -934,7 +947,7 @@ def main():
     dp.startup.register(on_startup)
     setup_application(app, dp, bot=bot)
 
-    print("🤖 Бот AirgramBot запущен!")
+    print("🤖 Бот AirgramBot запущен с поддержкой CORS!")
     web.run_app(app, host="0.0.0.0", port=PORT)
 
 if __name__ == "__main__":
