@@ -123,7 +123,6 @@ async def get_accepted_count():
 
 async def add_application(user_id, username, user_name):
     now_str = datetime.now().strftime("%d.%m.%Y %H:%M")
-    # Создаём документ с автоматическим ID
     app_ref = db.collection("applications").document()
     app_id = app_ref.id
     app_ref.set({
@@ -133,7 +132,6 @@ async def add_application(user_id, username, user_name):
         "date": now_str,
         "status": "pending"
     })
-
     user_ref = db.collection("users").document(s_id(user_id))
     user_doc = user_ref.get()
     if user_doc.exists:
@@ -163,12 +161,6 @@ async def get_application_by_id(app_id):
         data = doc.to_dict()
         data['id'] = app_id
         return data
-    return None
-
-async def get_application_by_user(user_id):
-    docs = db.collection("applications").where("user_id", "==", int(user_id)).where("status", "==", "pending").limit(1).stream()
-    for d in docs:
-        return [d.id, d.to_dict().get("user_id"), d.to_dict().get("username"), d.to_dict().get("user_name"), d.to_dict().get("date")]
     return None
 
 async def get_user_applications(user_id):
@@ -273,6 +265,14 @@ async def add_support_message(user_id, username, user_name, message, file_id=Non
     })
     return ticket_id
 
+async def get_support_message_by_id(ticket_id):
+    doc = db.collection("support_messages").document(ticket_id).get()
+    if doc.exists:
+        data = doc.to_dict()
+        data['id'] = ticket_id
+        return data
+    return None
+
 async def get_support_messages_active():
     docs = db.collection("support_messages").where("status", "==", "active").stream()
     return [[d.id, d.to_dict().get("user_id"), d.to_dict().get("username"), d.to_dict().get("user_name"), d.to_dict().get("message"), d.to_dict().get("file_id"), d.to_dict().get("file_type"), d.to_dict().get("date")] for d in docs]
@@ -313,6 +313,7 @@ class ApplicationState(StatesGroup):
     waiting_broadcast = State()
     waiting_support = State()
     waiting_support_reply = State()
+    waiting_request_message = State()  # для /request
 
 # ===== ХЕНДЛЕРЫ =====
 
@@ -368,15 +369,41 @@ async def admin_commands_list(message: types.Message):
         "📋 <code>/applications</code> — Показать текущие заявки\n"
         "📊 <code>/stats</code> — Полная статистика бота\n"
         "📢 <code>/broadcast [текст]</code> — Быстрая рассылка\n"
+        "🔇 <code>/mute [ID]</code> — Замутить пользователя на 1 час\n"
         "🔇 <code>/unmute [ID]</code> — Снять мут с пользователя\n"
         "🔓 <code>/unblock [ID]</code> — Разблокировать пользователя\n"
         "⛔ <code>/ban @username</code> — Забанить по юзернейму\n"
         "⛔ <code>/blacklist</code> — Показать черный список\n"
         "ℹ️ <code>/userinfo [ID]</code> — Инфо о пользователе\n"
         "👥 <code>/users</code> — Список пользователей\n"
-        "❓ <code>/come</code> — Показать эту справку"
+        "❓ <code>/come</code> — Показать эту справку\n"
+        "\n📨 <b>Техподдержка:</b>\n"
+        "📩 <code>/request [ticket_id]</code> — Ответить в обращение (админ — пользователю, пользователь — админам)\n"
+        "🔒 <code>/close [ticket_id]</code> — Закрыть обращение (только админ)\n"
+        "🔓 <code>/open [ticket_id]</code> — Открыть закрытое обращение (только админ)"
     )
     await message.answer(commands_text, parse_mode="HTML")
+
+# ------ Команды мута/бана ------
+@dp.message(Command("mute"))
+async def mute_command(message: types.Message):
+    if not is_admin_sync(message.from_user.id):
+        return
+    try:
+        args = message.text.split()
+        if len(args) < 2:
+            await message.answer("❌ Использование: <code>/mute [ID]</code>", parse_mode="HTML")
+            return
+        target_id = int(args[1])
+        mute_until = datetime.now() + timedelta(hours=1)
+        await add_mute(target_id, mute_until.timestamp())
+        await message.answer(f"✅ Пользователь <code>{target_id}</code> замучен на 1 час.", parse_mode="HTML")
+        try:
+            await bot.send_message(target_id, "🔇 <b>Вы получили ограничение на отправку сообщений (Мут) на 1 час.</b>", parse_mode="HTML")
+        except:
+            pass
+    except:
+        await message.answer("❌ Ошибка ввода. Формат: <code>/mute [ID]</code>", parse_mode="HTML")
 
 @dp.message(Command("ban"))
 async def ban_by_username(message: types.Message):
@@ -420,6 +447,36 @@ async def show_users_list(message: types.Message):
     if len(users) > 20:
         text += f"\n<i>...и ещё {len(users) - 20} пользователей.</i>"
     await message.answer(text, parse_mode="HTML")
+
+@dp.message(Command("unmute"))
+async def unmute_command(message: types.Message):
+    if not is_admin_sync(message.from_user.id):
+        return
+    try:
+        target_id = int(message.text.split()[1])
+        await remove_mute(target_id)
+        await message.answer(f"✅ Ограничения (мут) с пользователя <code>{target_id}</code> успешно сняты.", parse_mode="HTML")
+        try:
+            await bot.send_message(target_id, "🔊 <b>С вас снято ограничение на отправку сообщений!</b>", parse_mode="HTML")
+        except:
+            pass
+    except:
+        await message.answer("❌ Ошибка ввода. Формат: /unmute [ID]")
+
+@dp.message(Command("unblock"))
+async def unblock_command(message: types.Message):
+    if not is_admin_sync(message.from_user.id):
+        return
+    try:
+        target_id = int(message.text.split()[1])
+        await remove_from_blacklist(target_id)
+        await message.answer(f"✅ Пользователь <code>{target_id}</code> успешно разблокирован.", parse_mode="HTML")
+        try:
+            await bot.send_message(target_id, "🔓 <b>Администратор разблокировал ваш профиль в боте.</b>", parse_mode="HTML")
+        except:
+            pass
+    except:
+        await message.answer("❌ Ошибка ввода. Формат: /unblock [ID]")
 
 # ------ ТЕХПОДДЕРЖКА (Пользователь) ------
 @dp.message(F.text == "🆘 Техподдержка")
@@ -500,7 +557,7 @@ async def get_support_message(message: types.Message, state: FSMContext):
             pass
     await state.clear()
 
-# -------- Ответ админа на обращение ----------
+# -------- Ответ админа на обращение (через кнопку) ----------
 @dp.callback_query(F.data.startswith("support_reply_"))
 async def support_reply(callback: types.CallbackQuery, state: FSMContext):
     if not is_admin_sync(callback.from_user.id):
@@ -557,7 +614,7 @@ async def send_support_reply(message: types.Message, state: FSMContext):
         await message.answer(f"❌ Не удалось отправить ответ: {str(e)}")
     await state.clear()
 
-# -------- Закрытие обращения админом ----------
+# -------- Закрытие обращения админом (через кнопку) ----------
 @dp.callback_query(F.data.startswith("support_close_"))
 async def support_close(callback: types.CallbackQuery):
     if not is_admin_sync(callback.from_user.id):
@@ -584,7 +641,7 @@ async def support_close(callback: types.CallbackQuery):
     await callback.message.edit_text(callback.message.text + f"\n\n✅ <b>ЗАКРЫТО администратором {admin_name}</b>", parse_mode="HTML", reply_markup=None)
     await callback.answer("Обращение закрыто")
 
-# -------- Открытие обращения админом (дополнительно) ----------
+# -------- Открытие обращения админом (через кнопку) ----------
 @dp.callback_query(F.data.startswith("support_open_"))
 async def support_open(callback: types.CallbackQuery):
     if not is_admin_sync(callback.from_user.id):
@@ -626,6 +683,190 @@ async def my_support_messages(message: types.Message):
         status_emoji = {'active': '🟢 Активно', 'closed': '🔴 Закрыто'}.get(status, '❓ Неизвестно')
         text += f"• <code>{msg_id}</code> | {status_emoji}\n<pre>Дата: {date}\nСообщение: {msg_text[:50]}{'...' if len(msg_text)>50 else ''}</pre>\n"
     await message.answer(text, parse_mode="HTML")
+
+# ===== НОВЫЕ КОМАНДЫ ДЛЯ РАБОТЫ С ОБРАЩЕНИЯМИ =====
+
+# ---- /request ----
+@dp.message(Command("request"))
+async def request_command(message: types.Message, state: FSMContext):
+    args = message.text.split()
+    if len(args) < 2:
+        await message.answer("❌ Использование: <code>/request [ticket_id]</code> — отправьте сообщение по обращению.\n\nДля пользователя: ответ уйдёт админам.\nДля админа: ответ уйдёт пользователю.", parse_mode="HTML")
+        return
+    ticket_id = args[1]
+    # Проверяем, существует ли тикет
+    ticket = await get_support_message_by_id(ticket_id)
+    if not ticket:
+        await message.answer("❌ Обращение с таким ID не найдено.")
+        return
+    # Проверяем, что пользователь имеет отношение к тикету (или админ)
+    user_id = message.from_user.id
+    if not is_admin_sync(user_id) and ticket.get("user_id") != user_id:
+        await message.answer("❌ Это не ваше обращение. Вы не можете отвечать на него.")
+        return
+    # Проверяем статус (можно отвечать только в активные)
+    if ticket.get("status") != "active":
+        await message.answer("❌ Это обращение уже закрыто. Открыть его может только администратор командой /open.")
+        return
+    # Сохраняем тикет в состоянии и просим ввести текст ответа
+    await state.update_data(request_ticket_id=ticket_id)
+    await message.answer("✏️ Введите текст ответа (или прикрепите медиафайл):")
+    await state.set_state(ApplicationState.waiting_request_message)
+
+# ---- Обработка ответа на /request ----
+@dp.message(StateFilter(ApplicationState.waiting_request_message))
+async def process_request_message(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    ticket_id = data.get("request_ticket_id")
+    if not ticket_id:
+        await message.answer("❌ Ошибка: не найден ID обращения. Попробуйте снова /request.")
+        await state.clear()
+        return
+
+    # Получаем данные тикета
+    ticket = await get_support_message_by_id(ticket_id)
+    if not ticket:
+        await message.answer("❌ Обращение не найдено.")
+        await state.clear()
+        return
+
+    user_id = message.from_user.id
+    is_admin = is_admin_sync(user_id)
+    target_user_id = ticket.get("user_id")
+
+    # Проверяем, что пользователь не забанен и не замучен (если он не админ)
+    if not is_admin:
+        if await is_in_blacklist(user_id) or await is_muted(user_id):
+            await message.answer("⛔ Вы не можете отправлять сообщения из-за ограничений.")
+            await state.clear()
+            return
+
+    # Получаем текст или медиа
+    file_id, file_type, msg_text = None, None, ""
+    if message.text:
+        msg_text = message.text
+    elif message.photo:
+        file_id, file_type, msg_text = message.photo[-1].file_id, "photo", message.caption or "📷 Фото"
+    elif message.video:
+        file_id, file_type, msg_text = message.video.file_id, "video", message.caption or "🎥 Видео"
+    elif message.document:
+        file_id, file_type, msg_text = message.document.file_id, "document", message.caption or "📄 Документ"
+    elif message.audio:
+        file_id, file_type, msg_text = message.audio.file_id, "audio", message.caption or "🎵 Аудио"
+    elif message.voice:
+        file_id, file_type, msg_text = message.voice.file_id, "voice", message.caption or "🎤 Голосовое сообщение"
+    elif message.animation:
+        file_id, file_type, msg_text = message.animation.file_id, "animation", message.caption or "🔄 GIF"
+    else:
+        await message.answer("❌ Отправьте текст или поддерживаемый медиафайл.")
+        return
+
+    sender_name = message.from_user.full_name
+    sender_username = message.from_user.username or "нет"
+
+    if is_admin:
+        # Админ отвечает пользователю
+        header = f"💬 <b>Ответ от техподдержки ({sender_name}):</b>\n\n{msg_text}"
+        try:
+            if file_id:
+                if file_type == "photo":
+                    await bot.send_photo(target_user_id, file_id, caption=header, parse_mode="HTML")
+                elif file_type == "video":
+                    await bot.send_video(target_user_id, file_id, caption=header, parse_mode="HTML")
+                elif file_type == "document":
+                    await bot.send_document(target_user_id, file_id, caption=header, parse_mode="HTML")
+                elif file_type == "audio":
+                    await bot.send_audio(target_user_id, file_id, caption=header, parse_mode="HTML")
+                elif file_type == "voice":
+                    await bot.send_voice(target_user_id, file_id, caption=f"💬 <b>Голосовой ответ от техподдержки ({sender_name})</b>", parse_mode="HTML")
+                elif file_type == "animation":
+                    await bot.send_animation(target_user_id, file_id, caption=header, parse_mode="HTML")
+            else:
+                await bot.send_message(target_user_id, header, parse_mode="HTML")
+            await message.answer(f"✅ Ответ доставлен пользователю <code>{target_user_id}</code> в обращении <code>{ticket_id}</code>.", parse_mode="HTML")
+        except Exception as e:
+            await message.answer(f"❌ Не удалось отправить ответ: {e}")
+    else:
+        # Пользователь отвечает админам
+        header = f"💬 <b>Новое сообщение от пользователя ({sender_name}):</b>\n(обращение {ticket_id})\n\n{msg_text}"
+        for admin_id in ADMIN_IDS:
+            try:
+                if file_id:
+                    if file_type == "photo":
+                        await bot.send_photo(admin_id, file_id, caption=header, parse_mode="HTML")
+                    elif file_type == "video":
+                        await bot.send_video(admin_id, file_id, caption=header, parse_mode="HTML")
+                    elif file_type == "document":
+                        await bot.send_document(admin_id, file_id, caption=header, parse_mode="HTML")
+                    elif file_type == "audio":
+                        await bot.send_audio(admin_id, file_id, caption=header, parse_mode="HTML")
+                    elif file_type == "voice":
+                        await bot.send_voice(admin_id, file_id, caption=f"💬 <b>Голосовое сообщение от пользователя ({sender_name})</b>", parse_mode="HTML")
+                    elif file_type == "animation":
+                        await bot.send_animation(admin_id, file_id, caption=header, parse_mode="HTML")
+                else:
+                    await bot.send_message(admin_id, header, parse_mode="HTML")
+            except:
+                pass
+        await message.answer(f"✅ Ваше сообщение доставлено администраторам (обращение {ticket_id}).", parse_mode="HTML")
+
+    await state.clear()
+
+# ---- /close ----
+@dp.message(Command("close"))
+async def close_ticket_command(message: types.Message):
+    if not is_admin_sync(message.from_user.id):
+        await message.answer("⛔ Только для администраторов.")
+        return
+    args = message.text.split()
+    if len(args) < 2:
+        await message.answer("❌ Использование: <code>/close [ticket_id]</code>", parse_mode="HTML")
+        return
+    ticket_id = args[1]
+    ticket = await get_support_message_by_id(ticket_id)
+    if not ticket:
+        await message.answer("❌ Обращение не найдено.")
+        return
+    if ticket.get("status") == "closed":
+        await message.answer("❌ Обращение уже закрыто.")
+        return
+    await update_support_status(ticket_id, "closed")
+    await message.answer(f"✅ Обращение <code>{ticket_id}</code> закрыто.", parse_mode="HTML")
+    # Уведомляем пользователя
+    try:
+        user_id = ticket.get("user_id")
+        if user_id:
+            await bot.send_message(user_id, f"❌ <b>Ваше обращение {ticket_id} было закрыто администратором.</b>", parse_mode="HTML")
+    except:
+        pass
+
+# ---- /open ----
+@dp.message(Command("open"))
+async def open_ticket_command(message: types.Message):
+    if not is_admin_sync(message.from_user.id):
+        await message.answer("⛔ Только для администраторов.")
+        return
+    args = message.text.split()
+    if len(args) < 2:
+        await message.answer("❌ Использование: <code>/open [ticket_id]</code>", parse_mode="HTML")
+        return
+    ticket_id = args[1]
+    ticket = await get_support_message_by_id(ticket_id)
+    if not ticket:
+        await message.answer("❌ Обращение не найдено.")
+        return
+    if ticket.get("status") == "active":
+        await message.answer("❌ Обращение уже активно.")
+        return
+    await update_support_status(ticket_id, "active")
+    await message.answer(f"✅ Обращение <code>{ticket_id}</code> открыто.", parse_mode="HTML")
+    # Уведомляем пользователя
+    try:
+        user_id = ticket.get("user_id")
+        if user_id:
+            await bot.send_message(user_id, f"🔄 <b>Ваше обращение {ticket_id} было снова открыто администратором.</b>", parse_mode="HTML")
+    except:
+        pass
 
 # ------ ЗАЯВКИ ------
 @dp.message(F.text == "📝 Отправить заявку")
@@ -874,7 +1115,7 @@ async def cmd_broadcast(message: types.Message):
             pass
     await message.answer(f"✅ Успешно доставлено: {success} пользователям.")
 
-# ------ userinfo, unmute, unblock ------
+# ------ userinfo ------
 @dp.message(Command("userinfo"))
 async def user_info(message: types.Message):
     if not is_admin_sync(message.from_user.id):
@@ -902,36 +1143,6 @@ async def user_info(message: types.Message):
     except:
         await message.answer("❌ Произошла системная ошибка при парсинге ID.")
 
-@dp.message(Command("unmute"))
-async def unmute_command(message: types.Message):
-    if not is_admin_sync(message.from_user.id):
-        return
-    try:
-        target_id = int(message.text.split()[1])
-        await remove_mute(target_id)
-        await message.answer(f"✅ Ограничения (мут) с пользователя <code>{target_id}</code> успешно сняты.", parse_mode="HTML")
-        try:
-            await bot.send_message(target_id, "🔊 <b>С вас снято ограничение на отправку сообщений!</b>", parse_mode="HTML")
-        except:
-            pass
-    except:
-        await message.answer("❌ Ошибка ввода. Формат: /unmute [ID]")
-
-@dp.message(Command("unblock"))
-async def unblock_command(message: types.Message):
-    if not is_admin_sync(message.from_user.id):
-        return
-    try:
-        target_id = int(message.text.split()[1])
-        await remove_from_blacklist(target_id)
-        await message.answer(f"✅ Пользователь <code>{target_id}</code> успешно разблокирован.", parse_mode="HTML")
-        try:
-            await bot.send_message(target_id, "🔓 <b>Администратор разблокировал ваш профиль в боте.</b>", parse_mode="HTML")
-        except:
-            pass
-    except:
-        await message.answer("❌ Ошибка ввода. Формат: /unblock [ID]")
-
 # ===== ЗАПУСК =====
 async def on_startup(bot: Bot):
     await init_db()
@@ -954,7 +1165,7 @@ def main():
     dp.startup.register(on_startup)
     setup_application(app, dp, bot=bot)
 
-    print("🤖 Бот AirgramBot запущен (исправленная версия с поддержкой заявок и обращений)!")
+    print("🤖 Бот AirgramBot запущен (с поддержкой /request и /close)!")
     web.run_app(app, host="0.0.0.0", port=PORT)
 
 if __name__ == "__main__":
