@@ -123,14 +123,13 @@ async def get_accepted_count():
 
 async def add_application(user_id, username, user_name):
     now_str = datetime.now().strftime("%d.%m.%Y %H:%M")
-    doc_ref = db.collection("applications").add({
+    doc_ref, _ = db.collection("applications").add({
         "user_id": int(user_id),
         "username": username,
         "user_name": user_name,
         "date": now_str,
         "status": "pending"
     })
-    # Получаем ID документа для будущего использования
     application_id = doc_ref.id
 
     user_ref = db.collection("users").document(s_id(user_id))
@@ -176,7 +175,6 @@ async def get_user_applications(user_id):
 
 async def update_application_status(app_id, status):
     db.collection("applications").document(app_id).update({"status": status})
-    # Если статус accepted, обновляем счётчики
     if status == 'accepted':
         doc = db.collection("applications").document(app_id).get()
         if doc.exists:
@@ -257,7 +255,7 @@ async def get_user_id_by_username(username):
 
 # ---- Техподдержка ----
 async def add_support_message(user_id, username, user_name, message, file_id=None, file_type=None):
-    doc_ref = db.collection("support_messages").add({
+    doc_ref, _ = db.collection("support_messages").add({
         "user_id": int(user_id),
         "username": username,
         "user_name": user_name,
@@ -265,7 +263,7 @@ async def add_support_message(user_id, username, user_name, message, file_id=Non
         "file_id": file_id,
         "file_type": file_type,
         "date": datetime.now().strftime("%d.%m.%Y %H:%M"),
-        "status": "active"  # active / closed
+        "status": "active"
     })
     return doc_ref.id
 
@@ -280,8 +278,12 @@ async def get_support_message_by_user(user_id):
     return None
 
 async def get_user_support_messages(user_id):
-    docs = db.collection("support_messages").where("user_id", "==", int(user_id)).order_by("date", direction=firestore.Query.DESCENDING).limit(10).stream()
-    return [[d.id, d.to_dict().get("date"), d.to_dict().get("message"), d.to_dict().get("status")] for d in docs]
+    # Убираем order_by, чтобы не требовать индекс, сортируем на клиенте
+    docs = db.collection("support_messages").where("user_id", "==", int(user_id)).limit(10).stream()
+    messages = [[d.id, d.to_dict().get("date"), d.to_dict().get("message"), d.to_dict().get("status")] for d in docs]
+    # Сортируем по дате (убывание) вручную
+    messages.sort(key=lambda x: x[1], reverse=True)  # x[1] - дата
+    return messages
 
 async def update_support_status(msg_id, status):
     db.collection("support_messages").document(str(msg_id)).update({"status": status})
@@ -307,7 +309,6 @@ class ApplicationState(StatesGroup):
     waiting_broadcast = State()
     waiting_support = State()
     waiting_support_reply = State()
-    waiting_support_message_for_ticket = State()  # для ответа по конкретному обращению
 
 # ===== ХЕНДЛЕРЫ =====
 
@@ -517,7 +518,6 @@ async def send_support_reply(message: types.Message, state: FSMContext):
         await state.clear()
         return
 
-    # Получаем данные обращения
     doc = db.collection("support_messages").document(ticket_id).get()
     if not doc.exists:
         await message.answer("❌ Обращение не найдено.")
@@ -549,7 +549,6 @@ async def send_support_reply(message: types.Message, state: FSMContext):
             await bot.send_message(target_user_id, text=f"💬 <b>Ответ от техподдержки ({admin_name}):</b>\n\n{message.text}", parse_mode="HTML")
 
         await message.answer(f"✅ Ответ успешно доставлен пользователю <code>{target_user_id}</code>", parse_mode="HTML")
-        # Не меняем статус обращения, остаётся активным
     except Exception as e:
         await message.answer(f"❌ Не удалось отправить ответ: {str(e)}")
     await state.clear()
