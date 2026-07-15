@@ -121,9 +121,10 @@ async def get_accepted_count():
     doc = db.collection("stats").document("accepted_count").get()
     return doc.to_dict().get("value", 0) if doc.exists else 0
 
+# ---- ЗАЯВКИ ----
 async def add_application(user_id, username, user_name):
     now_str = datetime.now().strftime("%d.%m.%Y %H:%M")
-    doc_ref, _ = db.collection("applications").add({
+    doc_ref = db.collection("applications").add({
         "user_id": int(user_id),
         "username": username,
         "user_name": user_name,
@@ -163,15 +164,14 @@ async def get_application_by_id(app_id):
         return data
     return None
 
-async def get_application_by_user(user_id):
-    docs = db.collection("applications").where("user_id", "==", int(user_id)).where("status", "==", "pending").limit(1).stream()
-    for d in docs:
-        return [d.id, d.to_dict().get("user_id"), d.to_dict().get("username"), d.to_dict().get("user_name"), d.to_dict().get("date")]
-    return None
-
 async def get_user_applications(user_id):
-    docs = db.collection("applications").where("user_id", "==", int(user_id)).order_by("date", direction=firestore.Query.DESCENDING).limit(10).stream()
-    return [[d.id, d.to_dict().get("date"), d.to_dict().get("username"), d.to_dict().get("status")] for d in docs]
+    docs = db.collection("applications").where("user_id", "==", int(user_id)).stream()
+    # Сортируем вручную по дате (последние 10)
+    apps = []
+    for d in docs:
+        apps.append([d.id, d.to_dict().get("date"), d.to_dict().get("username"), d.to_dict().get("status")])
+    apps.sort(key=lambda x: x[1], reverse=True)  # сортировка по дате
+    return apps[:10]
 
 async def update_application_status(app_id, status):
     db.collection("applications").document(app_id).update({"status": status})
@@ -182,6 +182,7 @@ async def update_application_status(app_id, status):
             db.collection("users").document(s_id(user_id)).update({"accepted_applications": firestore.Increment(1)})
             db.collection("stats").document("accepted_count").update({"value": firestore.Increment(1)})
 
+# ---- Чёрный список и мут ----
 async def add_to_blacklist(user_id, reason="Нарушение правил"):
     now_str = datetime.now().strftime("%d.%m.%Y %H:%M")
     db.collection("blacklist").document(s_id(user_id)).set({
@@ -214,6 +215,7 @@ async def is_muted(user_id):
         return False
     return True
 
+# ---- Пользователи ----
 async def get_all_users():
     docs = db.collection("users").stream()
     return [int(d.id) for d in docs]
@@ -253,9 +255,9 @@ async def get_user_id_by_username(username):
         return d.to_dict().get("user_id")
     return None
 
-# ---- Техподдержка ----
+# ---- Техподдержка (исправлено) ----
 async def add_support_message(user_id, username, user_name, message, file_id=None, file_type=None):
-    doc_ref, _ = db.collection("support_messages").add({
+    doc_ref = db.collection("support_messages").add({
         "user_id": int(user_id),
         "username": username,
         "user_name": user_name,
@@ -265,25 +267,20 @@ async def add_support_message(user_id, username, user_name, message, file_id=Non
         "date": datetime.now().strftime("%d.%m.%Y %H:%M"),
         "status": "active"
     })
+    # doc_ref.id — это ID документа, возвращаем его
     return doc_ref.id
 
 async def get_support_messages_active():
     docs = db.collection("support_messages").where("status", "==", "active").stream()
     return [[d.id, d.to_dict().get("user_id"), d.to_dict().get("username"), d.to_dict().get("user_name"), d.to_dict().get("message"), d.to_dict().get("file_id"), d.to_dict().get("file_type"), d.to_dict().get("date")] for d in docs]
 
-async def get_support_message_by_user(user_id):
-    docs = db.collection("support_messages").where("user_id", "==", int(user_id)).where("status", "==", "active").limit(1).stream()
-    for d in docs:
-        return [d.id, d.to_dict().get("user_id"), d.to_dict().get("username"), d.to_dict().get("user_name"), d.to_dict().get("message"), d.to_dict().get("file_id"), d.to_dict().get("file_type"), d.to_dict().get("date")]
-    return None
-
 async def get_user_support_messages(user_id):
-    # Убираем order_by, чтобы не требовать индекс, сортируем на клиенте
-    docs = db.collection("support_messages").where("user_id", "==", int(user_id)).limit(10).stream()
-    messages = [[d.id, d.to_dict().get("date"), d.to_dict().get("message"), d.to_dict().get("status")] for d in docs]
-    # Сортируем по дате (убывание) вручную
-    messages.sort(key=lambda x: x[1], reverse=True)  # x[1] - дата
-    return messages
+    docs = db.collection("support_messages").where("user_id", "==", int(user_id)).stream()
+    msgs = []
+    for d in docs:
+        msgs.append([d.id, d.to_dict().get("date"), d.to_dict().get("message"), d.to_dict().get("status")])
+    msgs.sort(key=lambda x: x[1], reverse=True)
+    return msgs[:10]
 
 async def update_support_status(msg_id, status):
     db.collection("support_messages").document(str(msg_id)).update({"status": status})
@@ -580,7 +577,7 @@ async def support_close(callback: types.CallbackQuery):
     await callback.message.edit_text(callback.message.text + f"\n\n✅ <b>ЗАКРЫТО администратором {admin_name}</b>", parse_mode="HTML", reply_markup=None)
     await callback.answer("Обращение закрыто")
 
-# -------- Открытие обращения админом (дополнительно) ----------
+# -------- Открытие обращения админом (если нужно) ----------
 @dp.callback_query(F.data.startswith("support_open_"))
 async def support_open(callback: types.CallbackQuery):
     if not is_admin_sync(callback.from_user.id):
@@ -950,7 +947,7 @@ def main():
     dp.startup.register(on_startup)
     setup_application(app, dp, bot=bot)
 
-    print("🤖 Бот AirgramBot запущен с улучшенной системой заявок и поддержки!")
+    print("🤖 Бот AirgramBot запущен (исправленная версия с поддержкой заявок и обращений)!")
     web.run_app(app, host="0.0.0.0", port=PORT)
 
 if __name__ == "__main__":
