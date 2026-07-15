@@ -123,6 +123,7 @@ async def get_accepted_count():
 
 async def add_application(user_id, username, user_name):
     now_str = datetime.now().strftime("%d.%m.%Y %H:%M")
+    # Используем add() правильно – он возвращает (DocumentReference, WriteResult)
     doc_ref, _ = db.collection("applications").add({
         "user_id": int(user_id),
         "username": username,
@@ -130,7 +131,7 @@ async def add_application(user_id, username, user_name):
         "date": now_str,
         "status": "pending"
     })
-    application_id = doc_ref.id
+    application_id = doc_ref.id  # Вот тут id
 
     user_ref = db.collection("users").document(s_id(user_id))
     user_doc = user_ref.get()
@@ -163,16 +164,13 @@ async def get_application_by_id(app_id):
         return data
     return None
 
-async def get_application_by_user(user_id):
-    docs = db.collection("applications").where("user_id", "==", int(user_id)).where("status", "==", "pending").limit(1).stream()
-    for d in docs:
-        return [d.id, d.to_dict().get("user_id"), d.to_dict().get("username"), d.to_dict().get("user_name"), d.to_dict().get("date")]
-    return None
-
 async def get_user_applications(user_id):
     docs = db.collection("applications").where("user_id", "==", int(user_id)).stream()
-    apps = [[d.id, d.to_dict().get("date"), d.to_dict().get("username"), d.to_dict().get("status")] for d in docs]
-    apps.sort(key=lambda x: x[1], reverse=True)
+    apps = []
+    for d in docs:
+        data = d.to_dict()
+        apps.append([d.id, data.get("date"), data.get("username"), data.get("status")])
+    apps.sort(key=lambda x: x[1] if x[1] else "", reverse=True)
     return apps[:10]
 
 async def update_application_status(app_id, status):
@@ -273,16 +271,13 @@ async def get_support_messages_active():
     docs = db.collection("support_messages").where("status", "==", "active").stream()
     return [[d.id, d.to_dict().get("user_id"), d.to_dict().get("username"), d.to_dict().get("user_name"), d.to_dict().get("message"), d.to_dict().get("file_id"), d.to_dict().get("file_type"), d.to_dict().get("date")] for d in docs]
 
-async def get_support_message_by_user(user_id):
-    docs = db.collection("support_messages").where("user_id", "==", int(user_id)).where("status", "==", "active").limit(1).stream()
-    for d in docs:
-        return [d.id, d.to_dict().get("user_id"), d.to_dict().get("username"), d.to_dict().get("user_name"), d.to_dict().get("message"), d.to_dict().get("file_id"), d.to_dict().get("file_type"), d.to_dict().get("date")]
-    return None
-
 async def get_user_support_messages(user_id):
     docs = db.collection("support_messages").where("user_id", "==", int(user_id)).stream()
-    msgs = [[d.id, d.to_dict().get("date"), d.to_dict().get("message"), d.to_dict().get("status")] for d in docs]
-    msgs.sort(key=lambda x: x[1], reverse=True)
+    msgs = []
+    for d in docs:
+        data = d.to_dict()
+        msgs.append([d.id, data.get("date"), data.get("message"), data.get("status")])
+    msgs.sort(key=lambda x: x[1] if x[1] else "", reverse=True)
     return msgs[:10]
 
 async def update_support_status(msg_id, status):
@@ -950,7 +945,7 @@ def main():
     dp.startup.register(on_startup)
     setup_application(app, dp, bot=bot)
 
-    print("🤖 Бот AirgramBot запущен с улучшенной системой заявок и поддержки!")
+    print("🤖 Бот AirgramBot запущен (исправленная версия с поддержкой заявок и обращений)!")
     web.run_app(app, host="0.0.0.0", port=PORT)
 
 if __name__ == "__main__":
