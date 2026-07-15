@@ -146,10 +146,12 @@ async def add_application(user_id, username, user_name):
     })
     user_ref = db.collection("users").document(s_id(user_id))
     user_doc = user_ref.get()
+    now_timestamp = int(datetime.now().timestamp())
     if user_doc.exists:
         user_ref.update({
             "last_visit": now_str,
-            "total_applications": firestore.Increment(1)
+            "total_applications": firestore.Increment(1),
+            "last_application_time": now_timestamp  # для кулдауна
         })
     else:
         user_ref.set({
@@ -159,7 +161,8 @@ async def add_application(user_id, username, user_name):
             "first_visit": now_str,
             "last_visit": now_str,
             "total_applications": 1,
-            "accepted_applications": 0
+            "accepted_applications": 0,
+            "last_application_time": now_timestamp
         })
 
 async def get_applications():
@@ -235,7 +238,8 @@ async def add_user_to_db(user_id, full_name, username):
             "first_visit": now_str,
             "last_visit": now_str,
             "total_applications": 0,
-            "accepted_applications": 0
+            "accepted_applications": 0,
+            "last_application_time": 0  # инициализируем
         })
 
 async def get_user_stats(user_id):
@@ -881,6 +885,17 @@ async def notify_handler(request):
         if await is_muted(int(user_id)):
             return web.json_response({"error": "User is muted"}, status=403)
 
+        # ===== ПРОВЕРКА КУЛДАУНА =====
+        user_doc = db.collection("users").document(s_id(user_id)).get()
+        if user_doc.exists:
+            last_app = user_doc.to_dict().get("last_application_time", 0)
+            now = int(datetime.now().timestamp())
+            if now - last_app < COOLDOWN_APPLICATION:
+                remaining = COOLDOWN_APPLICATION - (now - last_app)
+                return web.json_response({
+                    "error": f"Cooldown active, wait {remaining} seconds"
+                }, status=429)
+
         admin_text = (
             "📩 <b>НОВАЯ ЗАЯВКА (с сайта)</b>\n"
             "───────────────────────────\n"
@@ -938,7 +953,7 @@ async def health_check(request):
     return web.Response(text="Я живой и я работаю!", status=200)
 
 def main():
-    app = web.Application(middlewares=[cors_middleware])  # <-- добавляем CORS
+    app = web.Application(middlewares=[cors_middleware])
     webhook_requests_handler = SimpleRequestHandler(dispatcher=dp, bot=bot)
     webhook_requests_handler.register(app, path=WEBHOOK_PATH)
     app.router.add_get('/', health_check)
@@ -947,7 +962,7 @@ def main():
     dp.startup.register(on_startup)
     setup_application(app, dp, bot=bot)
 
-    print("🤖 Бот AirgramBot запущен с поддержкой CORS!")
+    print("🤖 Бот AirgramBot запущен с поддержкой CORS и кулдауна!")
     web.run_app(app, host="0.0.0.0", port=PORT)
 
 if __name__ == "__main__":
