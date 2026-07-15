@@ -86,7 +86,7 @@ async def refresh_admins():
 def is_admin_sync(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
-# ===== КУЛДАУН =====
+# ===== КУЛДАУН (для бота) =====
 def check_cooldown(user_id: int, cooldown_type: str) -> tuple:
     if is_admin_sync(user_id):
         return True, 0
@@ -151,7 +151,7 @@ async def add_application(user_id, username, user_name):
         user_ref.update({
             "last_visit": now_str,
             "total_applications": firestore.Increment(1),
-            "last_application_time": now_timestamp  # для кулдауна
+            "last_application_time": now_timestamp
         })
     else:
         user_ref.set({
@@ -239,7 +239,7 @@ async def add_user_to_db(user_id, full_name, username):
             "last_visit": now_str,
             "total_applications": 0,
             "accepted_applications": 0,
-            "last_application_time": 0  # инициализируем
+            "last_application_time": 0
         })
 
 async def get_user_stats(user_id):
@@ -860,7 +860,7 @@ async def unblock_command(message: types.Message):
     except:
         await message.answer("❌ Ошибка ввода. Формат: /unblock [ID]")
 
-# ===== НОВЫЙ ЭНДПОИНТ ДЛЯ УВЕДОМЛЕНИЙ (с проверками) =====
+# ===== ЭНДПОИНТ ДЛЯ УВЕДОМЛЕНИЙ (без проверки кулдауна) =====
 NOTIFY_SECRET = os.getenv("NOTIFY_SECRET", "a7f8g9h0j1k2l3m4n5o6p")
 
 async def notify_handler(request):
@@ -879,22 +879,11 @@ async def notify_handler(request):
         if not all([user_id, username, user_name, date]):
             return web.json_response({"error": "Missing fields"}, status=400)
 
-        # ===== ПРОВЕРКА СТАТУСА ПОЛЬЗОВАТЕЛЯ =====
+        # Проверяем только ЧС и мут (кулдаун НЕ проверяем)
         if await is_in_blacklist(int(user_id)):
             return web.json_response({"error": "User is blacklisted"}, status=403)
         if await is_muted(int(user_id)):
             return web.json_response({"error": "User is muted"}, status=403)
-
-        # ===== ПРОВЕРКА КУЛДАУНА =====
-        user_doc = db.collection("users").document(s_id(user_id)).get()
-        if user_doc.exists:
-            last_app = user_doc.to_dict().get("last_application_time", 0)
-            now = int(datetime.now().timestamp())
-            if now - last_app < COOLDOWN_APPLICATION:
-                remaining = COOLDOWN_APPLICATION - (now - last_app)
-                return web.json_response({
-                    "error": f"Cooldown active, wait {remaining} seconds"
-                }, status=429)
 
         admin_text = (
             "📩 <b>НОВАЯ ЗАЯВКА (с сайта)</b>\n"
@@ -962,7 +951,7 @@ def main():
     dp.startup.register(on_startup)
     setup_application(app, dp, bot=bot)
 
-    print("🤖 Бот AirgramBot запущен с поддержкой CORS и кулдауна!")
+    print("🤖 Бот AirgramBot запущен с поддержкой CORS (кулдаун на сервере отключён для /notify)!")
     web.run_app(app, host="0.0.0.0", port=PORT)
 
 if __name__ == "__main__":
