@@ -677,7 +677,7 @@ async def my_support_messages(message: types.Message):
     if not msgs:
         await message.answer("📭 У вас пока нет обращений в техподдержку.")
         return
-    text = "📨 <b>ИСТОРИЯ ОБРАЩЕНИЙ (До 10 шт)</b>\n"
+    text = "📨 <b>ИСТОРИЯ ОБРАЩЕНИЙ (До 10 шт) <code>/request</code> для того чтоб управлять обращением.</b>\n"
     text += "───────────────────────────\n"
     for msg_id, date, msg_text, status in msgs:
         status_emoji = {'active': '🟢 Активно', 'closed': '🔴 Закрыто'}.get(status, '❓ Неизвестно')
