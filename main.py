@@ -29,7 +29,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     exit("❌ BOT_TOKEN не задан!")
 
-COOLDOWN_APPLICATION = 300
+COOLDOWN_APPLICATION = 3600
 COOLDOWN_SUPPORT = 300
 
 logging.basicConfig(level=logging.INFO)
